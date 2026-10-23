@@ -1,0 +1,733 @@
+---
+title: "Wheat competition: quality checks and IGE estimation"
+author: "MOSAIC - IRD experiment 2026"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+    toc: true
+    number_sections: true
+geometry: margin=18mm
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+invisible(Sys.setlocale('LC_CTYPE','English_United States.utf8'))
+options(tinytex.engine_args=c('--miktex-disable-maintenance','--miktex-disable-installer'))
+suppressPackageStartupMessages({library(ggplot2);library(dplyr);library(tidyr)})
+root<-normalizePath('../..',winslash='/')
+input<-file.path(root,'data','2026_IRD_experiment','processed_data')
+pre_dir<-'preliminary_quality_checks';ige_dir<-'ige_estimations'
+dir.create(pre_dir,showWarnings=FALSE);dir.create(ige_dir,showWarnings=FALSE)
+knitr::opts_chunk$set(echo=TRUE,message=FALSE,warning=FALSE,cache=FALSE,size="small",
+ fig.width=10,fig.height=7,dpi=300,out.width='100%',fig.align='center')
+set.seed(2026)
+theme_set(theme_bw(base_size=11)+theme(panel.grid.minor=element_blank(),
+ strip.background=element_rect(fill='#EAF0F4'),legend.position='bottom'))
+rd<-function(f)read.csv2(file.path(input,f),fileEncoding='UTF-8-BOM',na.strings='NA')
+write_excel<-function(d,f){
+ lines<-character();con<-textConnection('lines','w',local=TRUE)
+ write.csv2(d,con,row.names=FALSE,na='NA');close(con)
+ con<-file(f,'wb');on.exit(close(con));writeBin(as.raw(c(239,187,191)),con)
+ writeBin(charToRaw(enc2utf8(paste0(paste(lines,collapse='\r\n'),'\r\n'))),con)
+}
+stars<-function(p)ifelse(is.na(p),'NA',ifelse(p<.001,'***',
+ ifelse(p<.01,'**',ifelse(p<.05,'*','ns'))))
+pfmt<-function(p)format.pval(p,digits=3,eps=.001)
+avg<-function(x)if(all(is.na(x)))NA_real_ else mean(x,na.rm=TRUE)
+grain<-rd('traits_pesee_grains.csv');straw<-rd('traits_pesee_pailles.csv')
+metro<-rd('traits_grain_metrologie.csv')
+sources<-list(grain=grain,straw=straw,metro=metro)
+source_traits<-list(grain=c('poids_grains_g','nb_epis'),straw='poids_pailles_g',
+ metro=c('mass_totale_mesuree_g','nb_grains','PMG'))
+traits6<-unlist(source_traits,use.names=FALSE)
+traits<-setdiff(traits6,'mass_totale_mesuree_g')
+labels<-c(poids_grains_g='Grain weight (g)',nb_epis='Number of ears',
+ poids_pailles_g='Straw weight (g)',mass_totale_mesuree_g='Instrument mass (g)',
+ nb_grains='Number of grains',PMG='Thousand-grain weight (g)')
+long<-bind_rows(lapply(names(sources),function(s){
+ sources[[s]] %>% mutate(source=s) %>%
+ pivot_longer(all_of(source_traits[[s]]),names_to='trait',values_to='value')
+})) %>% mutate(trait=factor(trait,levels=traits6))
+facets<-function()facet_wrap(~trait,scales='free',ncol=3,labeller=as_labeller(labels))
+pot_means<-long %>% group_by(source,trait,pot_id,pot_type,chapelle,row,column) %>%
+ summarise(n_observed=sum(!is.na(value)),mean_value=avg(value),
+ resown=max(resown),.groups='drop') %>% rename(value=mean_value)
+```
+
+# Scope and decisions
+
+All recorded observations are retained, including zeros, resown plants and
+harvest comments. Missing responses are not imputed. `resown=1` means that `r`
+was recorded in the reseeding column; its original `1` denotes later germination,
+not reseeding. Individual mono plants cannot be matched across source files:
+their comments/resown flags apply at pot--genotype level.
+
+Preliminary design and pot-type tests use mono/mixt pot means, avoiding treating
+two plants sharing a pot as independent. IGE models use individual responses
+and fit within-pot correlation. Instrument mass is omitted from IGE models.
+Step 3 predictions remain restricted to traits selecting M3.
+
+# Preliminary quality checks
+
+## Distributions and zero counts
+
+```{r distributions, fig.path='preliminary_quality_checks/figures/'}
+distribution<-long %>% group_by(trait) %>% summarise(n=sum(!is.na(value)),
+ zeros=sum(value==0,na.rm=TRUE),missing=sum(is.na(value)),.groups='drop') %>%
+ mutate(annotation=paste0('Zeros: ',zeros,'; n = ',n))
+ggplot(filter(long,!is.na(value)),aes(value))+
+ geom_histogram(bins=25,fill='#327FA5',colour='white')+facets()+
+ geom_label(data=distribution,aes(x=Inf,y=Inf,label=annotation),
+ inherit.aes=FALSE,hjust=1.04,vjust=1.1,size=3,linewidth=0)+
+ labs(x='Trait value',y='Number of measurements')
+knitr::kable(select(distribution,trait,n,zeros,missing),row.names=FALSE)
+```
+
+There are `r nrow(grain)` manual grain/straw observations and `r nrow(metro)`
+metrology observations. Zero counts are absolute counts, not missing values.
+The metrology shortfall is absent rows rather than NA values in existing rows.
+Extreme values are retained. Residual distributions, not raw distributions
+alone, are relevant to the Gaussian model assumptions.
+
+## Design effects
+
+The following comparisons are marginal Kruskal--Wallis tests. Means based on
+one available plant receive the same weight as means based on two. A resown
+pot means at least one genotype is recorded as resown. These limitations are
+addressed more directly in the subsequent plant-level mixed models.
+
+```{r design, fig.path='preliminary_quality_checks/figures/', fig.height=13, out.height='85%'}
+design_factors<-c('chapelle','row','column','resown')
+design_data<-bind_rows(lapply(design_factors,function(f){
+ pot_means %>% filter(pot_type!='solo',is.finite(value)) %>%
+ mutate(factor=f,group=as.character(.data[[f]]))
+}))
+design_tests<-design_data %>% group_by(trait,factor) %>%
+ summarise(n_pots=n(),p=if(n_distinct(group)>1 && n_distinct(value)>1)
+ kruskal.test(value~as.factor(group))$p.value else NA_real_,.groups='drop') %>%
+ mutate(q=p.adjust(p,'BH'),annotation=paste0(stars(q),' q=',pfmt(q)))
+design_data$group<-factor(design_data$group,
+ levels=as.character(sort(unique(as.numeric(design_data$group)))))
+ggplot(design_data,aes(group,value))+geom_boxplot(fill='#9DC6D8',outlier.shape=NA)+
+ geom_point(position=position_jitter(width=.15,seed=2026),alpha=.25,size=.6)+
+ facet_grid(trait~factor,scales='free',labeller=labeller(trait=labels))+
+ geom_label(data=design_tests,aes(x=Inf,y=Inf,label=annotation),
+ inherit.aes=FALSE,hjust=1.02,vjust=1.05,size=2.3,linewidth=0)+
+ scale_y_continuous(expand=expansion(mult=c(.04,.2)))+
+ labs(x='Factor level',y='Pot mean')+
+ theme(axis.text.x=element_text(size=6),strip.text=element_text(size=8))
+knitr::kable(design_tests %>% select(trait,factor,n_pots,p,q),digits=4)
+```
+
+There are `r sum(design_tests$q<.05,na.rm=TRUE)` associations with BH q < 0.05
+across the 24 tests. These are unadjusted for genotype and other design terms,
+not causal effects. Ordinal row/column positions include offset end pots and
+are not measured physical distances.
+
+## Mono versus mixt
+
+```{r pot-type, fig.path='preliminary_quality_checks/figures/'}
+type_data<-pot_means %>% filter(pot_type!='solo',is.finite(value))
+type_tests<-type_data %>% group_by(trait) %>% summarise(
+ p=wilcox.test(value~pot_type,exact=FALSE)$p.value,.groups='drop') %>%
+ mutate(q=p.adjust(p,'BH'),annotation=paste0(stars(q),' q=',pfmt(q)))
+ggplot(type_data,aes(pot_type,value))+geom_boxplot(fill='#9DC6D8',outlier.shape=NA)+
+ geom_point(position=position_jitter(width=.12,seed=2026),alpha=.3,size=.8)+facets()+
+ geom_label(data=type_tests,aes(x=Inf,y=Inf,label=annotation),
+ inherit.aes=FALSE,hjust=1.05,vjust=1.1,size=3,linewidth=0)+
+ labs(x='Pot type',y='Pot mean')
+knitr::kable(type_tests %>% select(trait,p,q),digits=4)
+```
+
+`r sum(type_tests$q<.05)` traits differ at BH q < 0.05. This marginal comparison
+differs from the genetically adjusted pot-type fixed-effect test in step 2.
+
+## Grain-weight method comparison
+
+Only solo/mixt plants can be matched unambiguously across source files.
+
+```{r method-comparison, fig.path='preliminary_quality_checks/figures/'}
+keys<-c('pot_id','pot_type','genotype_id','neighbour_id')
+a<-grain %>% filter(pot_type!='mono') %>% select(all_of(keys),poids_grains_g)
+b<-metro %>% filter(pot_type!='mono') %>% select(all_of(keys),mass_totale_mesuree_g)
+stopifnot(!anyDuplicated(a[keys]),!anyDuplicated(b[keys]))
+method_pairs<-inner_join(a,b,by=keys) %>%
+ filter(is.finite(poids_grains_g),is.finite(mass_totale_mesuree_g))
+method_cor<-cor.test(method_pairs$poids_grains_g,
+ method_pairs$mass_totale_mesuree_g,method='pearson')
+ggplot(method_pairs,aes(poids_grains_g,mass_totale_mesuree_g))+
+ geom_abline(slope=1,intercept=0,linetype=2,colour='grey50')+
+ geom_point(aes(colour=pot_type),alpha=.6)+coord_equal()+
+ labs(x='Manual grain weight (g)',y='Instrument grain mass (g)',
+ subtitle=sprintf('Pearson R = %.5f; nominal p %s; n = %d',
+ method_cor$estimate,pfmt(method_cor$p.value),nrow(method_pairs)))
+```
+
+Pearson R = `r round(unname(method_cor$estimate),5)` for
+`r nrow(method_pairs)` plants. Correlation is association, not agreement; inspect
+the equality line too. Nominal inference ignores within-pot dependence.
+The near duplication motivates omitting instrument mass from genetic models.
+
+## Pairwise trait correlations
+
+Pot means include all pot types without guessing mono plant matches. Spearman
+correlations are used consistently because several traits are discrete/skewed.
+
+```{r trait-correlations, fig.path='preliminary_quality_checks/figures/', fig.height=8}
+wide<-pot_means %>% select(pot_id,trait,value) %>%
+ pivot_wider(names_from=trait,values_from=value)
+cor_pairs<-bind_rows(lapply(combn(traits6,2,simplify=FALSE),function(pair){
+ xy<-wide[,pair];xy<-xy[complete.cases(xy),]
+ z<-cor.test(xy[[1]],xy[[2]],method='spearman',exact=FALSE)
+ data.frame(first=pair[1],second=pair[2],n=nrow(xy),rho=unname(z$estimate),p=z$p.value)
+})) %>% mutate(q=p.adjust(p,'BH'),stars=stars(q))
+tiles<-bind_rows(cor_pairs,cor_pairs %>% rename(first=second,second=first),
+ data.frame(first=traits6,second=traits6,n=nrow(wide),rho=1,p=NA,q=NA,stars='')) %>%
+ mutate(x=factor(first,levels=traits6),y=factor(second,levels=rev(traits6)),
+ text=paste0(sprintf('%.2f',rho),ifelse(stars=='ns','',stars)))
+ggplot(tiles,aes(x,y,fill=rho))+geom_tile(colour='white')+
+ geom_text(aes(label=text),size=3)+coord_fixed()+
+ scale_fill_gradient2(low='#C84A4A',mid='white',high='#287BB5',limits=c(-1,1))+
+ scale_x_discrete(labels=labels)+scale_y_discrete(labels=labels)+
+ theme(axis.text.x=element_text(angle=35,hjust=1))+
+ labs(x=NULL,y=NULL,fill='Spearman',subtitle='Pot means; BH stars across 15 pairs')
+```
+
+`r sum(cor_pairs$q<.05)` pairs have BH q < 0.05. Associations pool genotype,
+spatial and pot-type effects. Incomplete pots use available measurements.
+They do not identify genetic correlations or causal relationships.
+
+# IGE estimation
+
+## Equations and terms
+
+For focal genotype $i$ with neighbour $j$, the shared fixed part is
+\[
+F=\mu+\mathrm{Chapelle}_c+\beta_r\mathbf1(\mathrm{resown})
+  +\beta_m\mathbf1(\mathrm{mono}).
+\]
+The final term is omitted when the pot-type testing rule below drops it.
+\[
+\begin{aligned}
+M1:\ y_{ip}&=F+R_{c,r}+C_{c,k}+D_i+e_{ip},\\
+M2:\ y_{ip}&=F+R_{c,r}+C_{c,k}+D_i+I_j+e_{ip},\\
+M3:\ y_{ip}&=F+R_{c,r}+C_{c,k}+D_i+I_j+S_{ij}+e_{ip}.
+\end{aligned}
+\]
+$R_{c,r}$ and $C_{c,k}$ are random row and column effects within chapelle;
+$D_i$ is focal DGE, $I_j$ neighbour IGE and $S_{ij}$ the directed pair effect,
+distinct from $S_{ji}$. These have normal distributions with their own variances.
+In M2/M3 the same genotype's DGE and IGE have covariance
+\[
+(D_g,I_g)'\sim N\left(0,
+\begin{bmatrix}\sigma_D^2&\sigma_{DI}\\\sigma_{DI}&\sigma_I^2\end{bmatrix}\right),
+\quad\sigma_{DI}=\rho_{DI}\sigma_D\sigma_I.
+\]
+Different genotypes are independent: no additive relationship matrix is used.
+Two residuals sharing a pot have covariance
+\[
+R_p=\sigma_e^2\begin{bmatrix}1&\rho_e\\\rho_e&1\end{bmatrix};
+\]
+different pots are independent. Row/column and pair effects are independent
+of each other and of the DGE/IGE block. Count traits also use Gaussian models.
+
+```{r model-data}
+trait_file<-c(poids_grains_g='traits_pesee_grains.csv',nb_epis='traits_pesee_grains.csv',
+ poids_pailles_g='traits_pesee_pailles.csv',nb_grains='traits_grain_metrologie.csv',
+ PMG='traits_grain_metrologie.csv')
+prepare<-function(t){
+ d<-rd(trait_file[[t]]);d<-d[d$pot_type!='solo',];d$response<-d[[t]]
+ d<-do.call(rbind,lapply(split(d,d$pot_id),function(z){
+  miss<-setdiff(1:2,z$plant_id)
+  if(length(miss)){
+   stopifnot(nrow(z)==1,length(miss)==1)
+   extra<-z;extra$plant_id<-miss;extra$response<-NA_real_
+   extra$genotype_id<-z$neighbour_id;extra$neighbour_id<-z$genotype_id
+   ref<-grain[grain$pot_id==extra$pot_id & grain$genotype_id==extra$genotype_id,]
+   extra$resown<-ref$resown[1];z<-rbind(z,extra)
+  };z
+ }))
+ d<-d[order(d$pot_id,d$plant_id),];rownames(d)<-NULL
+ g<-sort(unique(c(d$genotype_id,d$neighbour_id)))
+ d$DGE<-factor(d$genotype_id,levels=g);d$IGE<-factor(d$neighbour_id,levels=g)
+ d$DGExIGE<-factor(paste0('g',d$genotype_id,'_n',d$neighbour_id))
+ d$chapelle<-factor(d$chapelle);d$resown<-factor(d$resown)
+ d$pot_type<-factor(d$pot_type,levels=c('mixt','mono'))
+ d$row_group<-interaction(d$chapelle,d$row,drop=TRUE)
+ d$column_group<-interaction(d$chapelle,d$column,drop=TRUE)
+ d$pot<-factor(d$pot_id);d$plant<-factor(d$plant_id,levels=1:2)
+ stopifnot(!anyDuplicated(d[c('pot','plant')]),all(table(d$pot)==2));d
+}
+data_list<-setNames(lapply(traits,prepare),traits)
+```
+
+NA response slots complete the residual grid; they do not impute phenotypes.
+
+## Pot-type fixed-effect tests and fitting
+
+A conditional asymptotic Wald test ($z^2$, one degree of freedom) tests the
+mono coefficient in each M1/M2/M3 fit. This does not compare REML likelihoods
+with different fixed structures. Raw p < 0.05 screens pot type. A trait retains
+it in all three candidates if any candidate supports it; otherwise all three
+drop it. Thus each subsequent REML LRT has identical fixed terms. Screening,
+model selection and variance-parameter uncertainty are not propagated into
+nominal Wald/LRT p-values.
+
+```{r fitting-functions}
+random_forms<-list(M1=~row_group+column_group+DGE,
+ M2=~row_group+column_group+str(~DGE+IGE,~corgh(2):id(DGE)),
+ M3=~row_group+column_group+str(~DGE+IGE,~corgh(2):id(DGE))+DGExIGE)
+fit_model<-function(d,m,with_type){
+ fixed<-if(with_type)response~chapelle+resown+pot_type else response~chapelle+resown
+ once<-function(gp=list(),rp=list())asreml::asreml(fixed=fixed,
+  random=random_forms[[m]],residual=~id(pot):corv(plant),data=d,
+  G.param=gp,R.param=rp,na.action=asreml::na.method(y='include',x='fail'),
+  maxit=100,workspace='256mb',trace=FALSE)
+ f<-once();if(!isTRUE(f$converge))f<-update(f,maxit=100)
+ if(!isTRUE(f$converge))stop('Nonconverged model: ',m)
+ if(m!='M1'){
+  base<-f
+  for(rho in c(-.8,0,.8)){
+   gp<-base$G.param
+   for(term in names(gp))for(j in seq_along(gp[[term]])){
+    b<-gp[[term]][[j]];if(!is.null(b$con))b$con[b$con=='B']<-'P'
+    gp[[term]][[j]]<-b
+   }
+   gp[['DGE+IGE']][['2']]$initial[]<-
+    c(rho,.15*var(d$response,na.rm=TRUE),.05*var(d$response,na.rm=TRUE))
+   gp[['DGE+IGE']][['2']]$con<-c('U','P','P')
+   candidate<-try(once(gp,base$R.param),silent=TRUE)
+   valid<-!inherits(candidate,'try-error') && isTRUE(candidate$converge)
+   if(valid && candidate$loglik>f$loglik)f<-candidate
+  }
+ };f
+}
+```
+
+```{r pot-type-tests}
+full_models<-list();pot_tests<-list();keep_type<-setNames(logical(length(traits)),traits)
+for(t in traits){
+ full_models[[t]]<-setNames(lapply(names(random_forms),function(m)
+  fit_model(data_list[[t]],m,TRUE)),names(random_forms))
+ pot_tests[[t]]<-bind_rows(lapply(names(random_forms),function(m){
+  co<-summary(full_models[[t]][[m]],coef=TRUE)$coef.fixed
+  ix<-match('pot_type_mono',rownames(co));stopifnot(!is.na(ix))
+  estimate<-co[ix,'solution'];se<-co[ix,'std error']
+  data.frame(trait=t,model=m,mono_minus_mixt=estimate,SE=se,
+   p=pchisq((estimate/se)^2,1,lower.tail=FALSE))
+ }))
+ keep_type[t]<-any(pot_tests[[t]]$p<.05)
+}
+pot_tests<-bind_rows(pot_tests)
+knitr::kable(pot_tests,digits=4,row.names=FALSE)
+```
+
+Pot type retained for: **`r if(any(keep_type))paste(names(keep_type)[keep_type],collapse=', ')else 'none of the traits'`**.
+Dropping it does not prove its effect is zero; the allocation of average
+mono--mixt differences among genetic terms changes.
+
+## Model selection
+
+M1--M2 jointly tests IGE variance and DGE--IGE covariance, using the asymptotic
+mixture $0.5\chi^2_1+0.5\chi^2_2$. M2--M3 tests one interaction variance using
+$0.5\chi^2_0+0.5\chi^2_1$. With ten genotypes and boundary estimates these
+approximations warrant caution. Select M3 if M3--M2 has p < 0.05; otherwise
+select M2 if M2--M1 has p < 0.05, else M1. BH across ten tests is supplementary.
+
+```{r selection}
+models<-list();lrt<-list();selection<-list()
+for(t in traits){
+ models[[t]]<-if(keep_type[t])full_models[[t]] else
+  setNames(lapply(names(random_forms),function(m)fit_model(data_list[[t]],m,FALSE)),
+   names(random_forms))
+ compare<-function(a,b,joint){
+  delta<-b$loglik-a$loglik
+  if(delta< -1e-3)stop('Nested likelihood ordering failed: ',t)
+  LR<-max(0,2*delta)
+  p<-if(LR==0)1 else if(joint)
+   .5*pchisq(LR,1,lower.tail=FALSE)+.5*pchisq(LR,2,lower.tail=FALSE) else
+   .5*pchisq(LR,1,lower.tail=FALSE)
+  data.frame(LR=LR,p=p)
+ }
+ a<-compare(models[[t]]$M1,models[[t]]$M2,TRUE)
+ b<-compare(models[[t]]$M2,models[[t]]$M3,FALSE)
+ best<-if(b$p<.05)'M3' else if(a$p<.05)'M2' else 'M1'
+ selection[[t]]<-data.frame(trait=t,pot_type_retained=keep_type[t],selected=best)
+ lrt[[t]]<-rbind(cbind(data.frame(trait=t,comparison='M1 to M2'),a),
+  cbind(data.frame(trait=t,comparison='M2 to M3'),b))
+}
+selection<-bind_rows(selection);lrt<-bind_rows(lrt) %>% mutate(q=p.adjust(p,'BH'))
+knitr::kable(selection,row.names=FALSE)
+knitr::kable(lrt,digits=5,row.names=FALSE)
+```
+
+Selected models: `r paste(paste(selection$trait,selection$selected),collapse='; ')`.
+There are `r sum(lrt$p<.05)` nominally significant and `r sum(lrt$q<.05)`
+BH-significant tests. These data do not warrant treating interaction selection
+as robust without sensitivity or bootstrap checks.
+
+## Marginal phenotypic variance shares
+
+The average conditional individual-plant variance, over the observed mono/mixt
+composition, is
+\[
+V_P=\sigma_D^2+\sigma_I^2+\sigma_S^2+2p_{mono}\sigma_{DI}
+ +\sigma_R^2+\sigma_C^2+\sigma_e^2.
+\]
+$p_{mono}$ is the fraction of observed plant responses in mono pots. In mixt
+pots different genotype effects are independent; in mono pots the same
+genotype supplies DGE and IGE, adding $2\sigma_{DI}$. Each component's share is
+$100v_k/V_P$. The covariance share is $100(2p_{mono}\sigma_{DI})/V_P$ and can
+be negative. Signed shares sum to 100%. Within-pot residual correlation changes
+between-plant covariance, not individual variance, and is not an additional
+variance component. Shares condition on fixed effects: they are not fractions
+of raw sample variance, total breeding-value variance, or causal contributions.
+
+```{r variance-functions}
+getv<-function(vc,n)as.numeric(vc[n,'component'])
+genetic_block<-function(f,m){
+ vc<-summary(f)$varcomp
+ if(m=='M1')return(c(D=getv(vc,'DGE'),I=0,cov=0,rho=NA))
+ vd<-getv(vc,'DGE+IGE!corgh(2)_1');vi<-getv(vc,'DGE+IGE!corgh(2)_2')
+ ix<-startsWith(rownames(vc),'DGE+IGE!') & endsWith(rownames(vc),'.cor')
+ rho<-as.numeric(vc[ix,'component']);stopifnot(length(rho)==1)
+ c(D=vd,I=vi,cov=rho*sqrt(vd*vi),rho=rho)
+}
+variance<-bind_rows(lapply(traits,function(t){
+ m<-selection$selected[selection$trait==t];f<-models[[t]][[m]]
+ vc<-summary(f)$varcomp;g<-genetic_block(f,m);d<-data_list[[t]]
+ pm<-mean(d$genotype_id[!is.na(d$response)]==d$neighbour_id[!is.na(d$response)])
+ v<-c(DGE=g[['D']],IGE=g[['I']],Interaction=if(m=='M3')getv(vc,'DGExIGE')else 0,
+  Covariance=2*pm*g[['cov']],Row=getv(vc,'row_group'),
+  Column=getv(vc,'column_group'),Residual=as.numeric(vc[endsWith(rownames(vc),'!var'),'component']))
+ data.frame(trait=t,component=names(v),variance=as.numeric(v),percent=100*v/sum(v))
+}))
+```
+
+```{r variance-plot, fig.path='ige_estimations/figures/'}
+variance$component<-factor(variance$component,
+ levels=c('DGE','IGE','Interaction','Covariance','Row','Column','Residual'))
+ggplot(variance,aes(trait,percent,fill=component))+geom_col(width=.7)+
+ scale_fill_manual(values=c('#277DA8','#E69F00','#8A62AA','#B95442',
+ '#B9C7C9','#D4DDDE','#EEEEEE'))+
+ labs(x=NULL,y='Share of modelled individual-plant variance (%)',fill='Component')+
+ theme(axis.text.x=element_text(angle=25,hjust=1))
+knitr::kable(variance %>% filter(component %in% c('DGE','IGE','Interaction','Covariance')) %>%
+ select(trait,component,percent),digits=3,row.names=FALSE)
+```
+
+## Genetic predictions and joint model-based errors
+
+Only M3-selected traits are exported. The DGE baseline is $B_i=\mu+D_i$.
+The directed interaction contribution is
+$H_{ij}=I_j+S_{ij}+\beta_m\mathbf1(i=j)$ when pot type is retained, and
+$I_j+S_{ij}$ when it is dropped. The interaction file has a single combined
+interaction column. Adding the baseline and interaction gives the fitted
+reference-condition one-neighbour expectation (chapelle 1, non-resown, zero
+random row/column effects). The baseline is not solo yield: it comes from the
+competition model with neighbour effects set to their population means.
+
+Joint errors must retain covariances between fixed and genetic terms and
+between different predictions. For $\theta=(\beta',u')'$, the error variance
+of $a'\widehat\theta$ is $a'C_\theta a$, not the sum of component SEs.
+With $V=ZGZ'+R$, define
+\[
+ C_\beta=(X'V^{-1}X)^{-1},\quad K=GZ'V^{-1},\quad B=KX.
+\]
+The joint BLUE/BLUP error covariance is
+\[
+C_\theta=\begin{bmatrix}
+ C_\beta&-C_\beta B'\\
+ -BC_\beta&G-KZG+BC_\beta B'
+\end{bmatrix}.
+\]
+We reconstruct this matrix from ASReml variance estimates and the observed-data
+design, then check coefficients and their standard errors against ASReml.
+For the joint prediction vector, with contrast matrix $L$,
+\[
+C_{pred}=LC_\theta L'.
+\]
+The prediction tables report $\sqrt{\mathrm{diag}(C_{pred})}$ and approximate
+95% bounds (estimate $\pm1.96$ SE). The complete joint covariance is exported
+per trait, with matching `prediction_id` labels. A grid prediction with weights
+$w$ has model-based error variance $w'C_{pred}w$, including reuse of the same
+effect across several neighbours.
+
+These errors condition on estimated variance parameters and the selected
+model. They exclude variance-parameter/model-selection uncertainty and the
+uncertainty of transferring one-neighbour effects to a grid. Bounds describe
+latent expectations, not intervals for a new plant's phenotype; future residual
+variation is not added. The mono fixed contrast, if retained, is experimental
+pot-type adjustment, not a calibrated response to multiple same-genotype
+neighbours.
+
+```{r joint-errors}
+joint_errors<-function(f,d,m,with_type){
+ d<-d[!is.na(d$response),]
+ fixed<-if(with_type)~chapelle+resown+pot_type else ~chapelle+resown
+ X<-model.matrix(fixed,d);stopifnot(qr(X)$rank==ncol(X))
+ xnames<-colnames(X)
+ for(term in c('chapelle','resown','pot_type'))
+  xnames<-sub(paste0('^',term),paste0(term,'_'),xnames)
+ colnames(X)<-xnames
+ zfactor<-function(v,term){
+  z<-model.matrix(~v-1);colnames(z)<-paste0(term,'_',levels(v));z
+ }
+ Zparts<-list(zfactor(d$row_group,'row_group'),
+  zfactor(d$column_group,'column_group'),zfactor(d$DGE,'DGE'))
+ vc<-summary(f)$varcomp;g<-genetic_block(f,m)
+ ng<-nlevels(d$DGE);nr<-nlevels(d$row_group);nc<-nlevels(d$column_group)
+ if(m!='M1')Zparts<-c(Zparts,list(zfactor(d$IGE,'IGE')))
+ if(m=='M3')Zparts<-c(Zparts,list(zfactor(d$DGExIGE,'DGExIGE')))
+ Z<-do.call(cbind,Zparts);G<-matrix(0,ncol(Z),ncol(Z))
+ diag(G)<-c(rep(getv(vc,'row_group'),nr),rep(getv(vc,'column_group'),nc),
+  rep(g[['D']],ng),if(m!='M1')rep(g[['I']],ng),
+  if(m=='M3')rep(getv(vc,'DGExIGE'),nlevels(d$DGExIGE)))
+ if(m!='M1'){
+  di<-nr+nc+seq_len(ng);ii<-nr+nc+ng+seq_len(ng)
+  G[cbind(di,ii)]<-g[['cov']];G[cbind(ii,di)]<-g[['cov']]
+ }
+ rho<-as.numeric(vc[endsWith(rownames(vc),'!plant!cor'),'component'])
+ ve<-as.numeric(vc[endsWith(rownames(vc),'!var'),'component'])
+ R<-ve*((1-rho)*diag(nrow(d))+rho*outer(d$pot_id,d$pot_id,'=='))
+ V<-Z%*%G%*%t(Z)+R;Vi<-chol2inv(chol(V))
+ Cb<-solve(crossprod(X,Vi%*%X));K<-G%*%t(Z)%*%Vi;B<-K%*%X
+ beta<-as.numeric(Cb%*%crossprod(X,Vi%*%d$response))
+ u<-as.numeric(K%*%(d$response-X%*%beta))
+ Cu<-G-K%*%Z%*%G+B%*%Cb%*%t(B)
+ C<-rbind(cbind(Cb,-Cb%*%t(B)),cbind(-B%*%Cb,Cu));C<-(C+t(C))/2
+ cn<-c(colnames(X),colnames(Z));dimnames(C)<-list(cn,cn)
+ theta<-setNames(c(beta,u),cn)
+ cf<-summary(f,coef=TRUE)$coef.fixed;cr<-summary(f,coef=TRUE)$coef.random
+ ref<-c(cf[match(colnames(X),rownames(cf)),'solution'],
+  cr[match(colnames(Z),rownames(cr)),'solution'])
+ ref_se<-c(cf[match(colnames(X),rownames(cf)),'std error'],
+  cr[match(colnames(Z),rownames(cr)),grep('^std[ .]error$',colnames(cr),value=TRUE)[1]])
+ difference<-max(abs(theta-ref),na.rm=TRUE)
+ se_difference<-max(abs(sqrt(pmax(0,diag(C)))-ref_se),na.rm=TRUE)
+ stopifnot(difference<.005,se_difference<.005)
+ list(theta=theta,C=C,estimate_check=difference,SE_check=se_difference)
+}
+prediction_dge<-prediction_interaction<-error_checks<-list()
+for(t in selection$trait[selection$selected=='M3']){
+ d<-data_list[[t]];f<-models[[t]]$M3;with_type<-keep_type[t]
+ j<-joint_errors(f,d,'M3',with_type);g<-levels(d$DGE)
+ pairs<-expand.grid(genotype=g,neighbour=g,stringsAsFactors=FALSE)
+ id_d<-paste0('DGE:',t,':',g)
+ id_h<-paste0('interaction:',t,':',pairs$genotype,':',pairs$neighbour)
+ L<-matrix(0,length(g)+nrow(pairs),length(j$theta),
+  dimnames=list(c(id_d,id_h),names(j$theta)))
+ for(i in seq_along(g))L[i,c('(Intercept)',paste0('DGE_',g[i]))]<-1
+ for(i in seq_len(nrow(pairs))){
+  ix<-length(g)+i
+  L[ix,c(paste0('IGE_',pairs$neighbour[i]),
+   paste0('DGExIGE_g',pairs$genotype[i],'_n',pairs$neighbour[i]))]<-1
+  if(with_type && pairs$genotype[i]==pairs$neighbour[i])L[ix,'pot_type_mono']<-1
+ }
+ values<-as.numeric(L%*%j$theta);CP<-L%*%j$C%*%t(L)
+ stopifnot(min(eigen(CP,symmetric=TRUE,only.values=TRUE)$values)> -1e-6)
+ se<-sqrt(pmax(0,diag(CP)));nd<-length(g);ih<-nd+seq_len(nrow(pairs))
+ prediction_dge[[t]]<-data.frame(trait=t,genotype=g,prediction_id=id_d,
+  intercept=j$theta[['(Intercept)']],DGE_BLUP=j$theta[paste0('DGE_',g)],
+  prediction=values[seq_len(nd)],prediction_formula='intercept + DGE',
+  prediction_SE=se[seq_len(nd)],
+  lower95=values[seq_len(nd)]-1.96*se[seq_len(nd)],
+  upper95=values[seq_len(nd)]+1.96*se[seq_len(nd)],
+  reference_chapelle=levels(d$chapelle)[1],reference_resown=levels(d$resown)[1],
+  reference_pot_type=if(with_type)'mixt' else 'not fitted',row.names=NULL)
+ prediction_interaction[[t]]<-data.frame(trait=t,pairs,prediction_id=id_h,
+  interaction=values[ih],
+  prediction_formula=ifelse(with_type & pairs$genotype==pairs$neighbour,
+    'IGE + DGE:IGE + mono fixed effect','IGE + DGE:IGE'),
+  prediction_SE=se[ih],
+  lower95=values[ih]-1.96*se[ih],upper95=values[ih]+1.96*se[ih],
+  pot_type_adjustment_included=with_type & pairs$genotype==pairs$neighbour)
+ write_excel(data.frame(prediction_id=rownames(CP),CP,check.names=FALSE),
+  file.path(ige_dir,paste0('prediction_error_covariance_',t,'.csv')))
+ error_checks[[t]]<-data.frame(trait=t,max_estimate_difference=j$estimate_check,
+  max_SE_difference=j$SE_check)
+}
+DGE<-if(length(prediction_dge))bind_rows(prediction_dge)else
+ data.frame(trait=character(),genotype=character(),prediction=numeric(),prediction_SE=numeric())
+interactions<-if(length(prediction_interaction))bind_rows(prediction_interaction)else
+ data.frame(trait=character(),genotype=character(),neighbour=character(),
+ interaction=numeric(),prediction_SE=numeric())
+write_excel(DGE,file.path(ige_dir,'03_DGE_genotype_predictions.csv'))
+write_excel(interactions,file.path(ige_dir,'03_all_genotype_interactions.csv'))
+knitr::kable(bind_rows(error_checks),digits=7,row.names=FALSE)
+knitr::kable(DGE %>% select(trait,genotype,prediction,prediction_SE),digits=4,row.names=FALSE)
+```
+
+The two main prediction files contain `r nrow(DGE)` baselines and
+`r nrow(interactions)` directed interactions. The covariance file supplies the
+error covariance for their concatenated vector. Baselines have the intercept
+added; interactions do not. Same-genotype and different-genotype predictions
+are together, and only same-genotype predictions include a mono contrast if
+that fixed term was retained. No individual genotype CSVs are generated.
+
+### Solo BLUEs versus competition DGE predictions
+
+The `prediction_formula` column states which fitted terms enter each exported
+prediction. The baseline is `intercept + DGE`; interaction predictions contain
+neighbour IGE plus the directed pair effect, with a mono fixed adjustment only
+if that term was retained. Prediction SEs use the joint errors for exactly
+those terms.
+
+For comparison with solo performance, genotype is fitted as a **fixed effect**
+in a separate ASReml model using all available solo observations:
+\[
+y_{ip}=\mu_s+\mathrm{Chapelle}_c+\beta_{r,s}\mathbf1(\mathrm{resown})
+       +G_i+R_{c,r}+C_{c,k}+e_{ip}.
+\]
+The solo expectation is the intercept plus genotype BLUE. Chapelle and resown
+are fixed, row/column within chapelle are random, and residuals are independent.
+Pot type cannot be fitted within a solo-only dataset and no within-pot residual
+correlation is estimable. Both comparisons refer to chapelle 1 and non-resown
+plants, with random spatial effects set to zero.
+
+```{r solo-blue-comparison, fig.path='ige_estimations/figures/'}
+# Solo BLUEs use fixed genotype and all applicable design corrections.
+# Pot type is constant for solo plants; no residual pair exists within a pot.
+solo_comparisons<-solo_correlations<-list()
+for(t in unique(DGE$trait)){
+ solo<-rd(trait_file[[t]])
+ solo<-solo[solo$pot_type=='solo' & is.finite(solo[[t]]),]
+ solo$response<-solo[[t]]
+ solo$genotype<-factor(solo$genotype_id,
+   levels=sort(unique(solo$genotype_id)))
+ solo$chapelle<-factor(solo$chapelle)
+ solo$resown<-factor(solo$resown)
+ solo$row_group<-interaction(solo$chapelle,solo$row,drop=TRUE)
+ solo$column_group<-interaction(solo$chapelle,solo$column,drop=TRUE)
+ solo_fit<-asreml::asreml(fixed=response~chapelle+resown+genotype,
+   random=~row_group+column_group,residual=~idv(units),data=solo,
+   na.action=asreml::na.method(y='fail',x='fail'),
+   maxit=100,workspace='256mb',trace=FALSE)
+ if(!isTRUE(solo_fit$converge))solo_fit<-update(solo_fit,maxit=100)
+ stopifnot(isTRUE(solo_fit$converge),!anyDuplicated(solo$pot_id))
+ co<-summary(solo_fit,coef=TRUE)$coef.fixed
+ g<-levels(solo$genotype)
+ ix<-match(paste0('genotype_',g),rownames(co))
+ intercept_ix<-match('(Intercept)',rownames(co))
+ ref_ix<-match(c(paste0('chapelle_',levels(solo$chapelle)[1]),
+   paste0('resown_',levels(solo$resown)[1])),rownames(co))
+ stopifnot(!anyNA(c(ix,intercept_ix,ref_ix)),
+   all(co[ref_ix,'solution']==0))
+ expected<-data.frame(genotype=g,
+   solo_BLUE=co[intercept_ix,'solution']+co[ix,'solution'])
+ baseline<-DGE[DGE$trait==t,c('genotype','prediction')]
+ baseline$genotype<-as.character(baseline$genotype)
+ matched<-merge(baseline,expected,by='genotype')
+ stopifnot(nrow(matched)==length(g),!anyDuplicated(matched$genotype))
+ test<-cor.test(matched$prediction,matched$solo_BLUE,method='pearson')
+ solo_correlations[[t]]<-data.frame(trait=t,n_genotypes=nrow(matched),
+   Pearson_R=unname(test$estimate),p_nominal=test$p.value)
+ solo_comparisons[[t]]<-matched
+ p<-ggplot(matched,aes(prediction,solo_BLUE))+
+   geom_smooth(method='lm',formula=y~x,se=FALSE,
+     colour='#B95442',linewidth=.7)+
+   geom_point(size=2.5,colour='#277DA8')+
+   geom_text(aes(label=genotype),vjust=-.8,size=3.5)+
+   scale_y_continuous(expand=expansion(mult=c(.08,.15)))+
+   labs(title=paste('Competition DGE versus solo BLUEs:',t),
+     subtitle=sprintf('Pearson R = %.3f; nominal p = %s; n = %d',
+       test$estimate,pfmt(test$p.value),nrow(matched)),
+     x='Competition-model intercept + DGE',
+     y='Design-adjusted solo intercept + genotype BLUE',
+     caption='Chapelle 1, non-resown; random spatial effects zero.\nNominal p ignores uncertainty/covariance of estimated genotype values.')
+ print(p)
+}
+solo_correlations<-dplyr::bind_rows(solo_correlations)
+knitr::kable(solo_correlations,digits=4,row.names=FALSE)
+```
+
+`r if(nrow(solo_correlations))paste(sprintf('%s: Pearson R = %.3f, nominal p = %s (%d genotypes).',solo_correlations$trait,solo_correlations$Pearson_R,pfmt(solo_correlations$p_nominal),solo_correlations$n_genotypes),collapse=' ')else 'No trait selects M3, so no comparison is produced.'`
+
+A positive correlation indicates that genotypes with larger DGE expectations
+also tend to have greater solo performance. This is not a test of equality:
+adding an intercept does not affect Pearson correlation, and high correlation
+can coexist with different absolute yield levels. The p-value tests zero
+correlation, not whether the correlation equals one.
+
+Perfect correlation is not expected for several reasons:
+
+- Solo performance and competition DGE are different quantities. The DGE
+  baseline is estimated in two-plant pots with neighbour effects centred at
+  zero; it is not an extrapolated absence-of-neighbour prediction.
+- The two analyses use different observations and density/competition contexts.
+  Each solo genotype has only three plants, making its adjusted mean noisy.
+- Solo genotype effects are BLUEs without genetic shrinkage. Competition DGEs
+  are BLUPs with shrinkage, informed by the joint DGE/IGE covariance and pair
+  interaction model. Uniform shrinkage alone would preserve correlation; here
+  information and adjustment can differ among genotypes.
+- Design and variance parameters are estimated separately. Sampling error,
+  unequal adjustments and genuine context-dependent genotype performance can
+  all contribute. This plot cannot separate those explanations.
+
+The correlation is descriptive: its nominal Pearson p-value ignores uncertainty
+and covariance in the estimated genotype values. It does not by itself prove
+that the underlying solo and competition genetic effects differ or agree.
+
+## Numerical and residual diagnostics
+
+```{r diagnostics}
+diagnostics<-bind_rows(lapply(traits,function(t){
+ bind_rows(lapply(names(random_forms),function(m){
+  f<-models[[t]][[m]];g<-genetic_block(f,m)
+  data.frame(trait=t,model=m,converged=f$converge,loglik=f$loglik,
+   DGE_IGE_correlation=g[['rho']])
+ }))
+}))
+knitr::kable(diagnostics,digits=4,row.names=FALSE)
+residual_data<-bind_rows(lapply(traits,function(t){
+ m<-selection$selected[selection$trait==t];f<-models[[t]][[m]];d<-data_list[[t]]
+ ok<-!is.na(d$response)
+ data.frame(trait=t,residual=as.numeric(f$residuals)[ok],
+ fitted=as.numeric(f$linear.predictors)[ok])
+}))
+```
+
+```{r residual-checks, fig.path='ige_estimations/figures/', fig.height=9}
+p1<-ggplot(residual_data,aes(sample=residual))+stat_qq(size=.6,alpha=.5)+
+ stat_qq_line(colour='#B95442')+facet_wrap(~trait,scales='free',ncol=3)+
+ labs(title='Selected-model residual Q-Q plots')
+p2<-ggplot(residual_data,aes(fitted,residual))+geom_hline(yintercept=0,
+ linetype=2,colour='#B95442')+geom_point(size=.6,alpha=.4)+
+ facet_wrap(~trait,scales='free',ncol=3)+labs(title='Residuals versus fitted values')
+patchwork::wrap_plots(p1,p2,ncol=1)
+```
+
+All `r nrow(diagnostics)` final models report convergence:
+**`r all(diagnostics$converged)`**. Multiple starting correlations were tried
+for M2/M3. Convergence does not validate the model assumptions. Q-Q plots of
+raw conditional residuals are descriptive: shrinkage and pot correlation
+mean they are not independent, identically distributed residual samples.
+Tail departures, especially for PMG and counts, and changing residual spread
+require investigation. Correlations near +/-1 make genetic components hard
+to separate. Bootstrap LRTs and influence analyses would strengthen inference.
+
+# Deliverables and reproducibility
+
+This report holds the code, main tests, figures and interpretation. The
+subfolders retain only figures and the genetic prediction/covariance tables.
+Intermediate inputs, model RDS objects and the old without-pot-type comparison
+are not needed to use the final predictions. Rerendering this report fits the
+models anew from processed data and requires ASReml-R licensing, the listed
+R packages, Pandoc and LaTeX.
+
+Genetic effects are total genotype-level effects, not additive-only effects.
+The exported normal-approximation errors describe within-model precision;
+they do not justify assuming additive or rank-independent interactions in a
+many-neighbour grid. Resowing is adjusted statistically; it is not a filter.
+
+```{r session, echo=FALSE}
+sessionInfo()
+```
+
+## Documentation
+
+ASReml REML likelihood tests:
+https://asreml.kb.vsni.co.uk/knowledge-base/lrt-asreml/
+
+ASReml prediction functions:
+https://asreml.kb.vsni.co.uk/knowledge-base/predict-asreml/
